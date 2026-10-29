@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+Generic data preprocessing for CSV / TSV / XLS / XLSX files.
+
+Pipeline:
+  1. Load file (auto-detects format, tries several encodings for text files)
+  2. Clean column names, strip whitespace, normalise missing-value tokens
+  3. Remove duplicate rows
+  4. Convert types (numeric-looking text -> numbers, date-looking text -> datetime)
+  5. Drop columns/rows with too much missing data
+  6. Impute remaining missing values (median / mode)
+  7. Handle outliers (IQR clipping)
+  8. Encode categorical columns (one-hot or label)
+  9. Scale numeric columns (standard or minmax)
+ 10. Save the processed file and print a summary report
+
+Usage:
+  python preprocess.py data.csv
+  python preprocess.py data.xlsx --sheet Sheet1 --target price --scale minmax
+  python preprocess.py data.csv -o clean.csv --encode label --outliers none
+
+Requirements: pip install pandas numpy openpyxl xlrd
+"""
+
+import argparse
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+MISSING_TOKENS = ["", " ", "na", "n/a", "nan", "null", "none", "-", "--", "?", "missing", "undefined"]
+
+
+# --------------------------------------------------------------------------- #
+# 1. Loading
+# --------------------------------------------------------------------------- #
+def load_data(path: str, sheet=0) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        sys.exit(f"File not found: {path}")
+
+    ext = p.suffix.lower()
+    if ext in (".xls", ".xlsx", ".xlsm"):
+        return pd.read_excel(p, sheet_name=sheet)
+
+    if ext in (".csv", ".tsv", ".txt"):
+        sep = "\t" if ext == ".tsv" else None  # None -> sniff delimiter
+        for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                return pd.read_csv(p, sep=sep, engine="python", encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        sys.exit("Could not decode the file with common encodings.")
+
+    sys.exit(f"Unsupported file type: {ext}")
+
+
+# --------------------------------------------------------------------------- #
+# 2-4. Cleaning and type conversion
+# --------------------------------------------------------------------------- #
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[^0-9a-z]+", "_", regex=True)
+        .str.strip("_")
+    )
+    # make duplicate names unique
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    return df
+
+
+def standardise_missing(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.select_dtypes(include="object").columns:
+        s = df[col].astype("string").str.strip()
+        df[col] = s.where(~s.str.lower().isin(MISSING_TOKENS), pd.NA)
+    return df
+
+
+def convert_types(df: pd.DataFrame, threshold: float = 0.9) -> pd.DataFrame:
+    """Convert object columns to numeric/datetime when >= `threshold` of values parse."""
+    df = df.copy()
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        non_null = df[col].dropna()
+        if non_null.empty:
+            continue
+
+        # numeric (also handles "1,234" and "$12.50" and "45%")
+        cleaned = non_null.astype(str).str.replace(r"[,$€£%\s]", "", regex=True)
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        if numeric.notna().mean() >= threshold:
+            full = df[col].astype(str).str.replace(r"[,$€£%\s]", "", regex=True)
+            df[col] = pd.to_numeric(full, errors="coerce")
+            continue
+
+        # datetime
+        try:
+            parsed = pd.to_datetime(non_null, errors="coerce")
+            if parsed.notna().mean() >= threshold:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        except (ValueError, TypeError):
+            pass
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# 5-6. Missing values
+# --------------------------------------------------------------------------- #
+def handle_missing(df, col_thresh=0.5, row_thresh=0.5, protected=()):
+    df = df.copy()
+
+    # drop columns that are mostly empty (never drop the target)
+    miss_ratio = df.isna().mean()
+    drop_cols = [c for c in df.columns if miss_ratio[c] > col_thresh and c not in protected]
+    df = df.drop(columns=drop_cols)
+
+    # drop rows that are mostly empty
+    df = df[df.isna().mean(axis=1) <= row_thresh]
+
+    # impute
+    for col in df.columns:
+        if not df[col].isna().any():
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].fillna(df[col].median())
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].ffill().bfill()
+        else:
+            mode = df[col].mode(dropna=True)
+            df[col] = df[col].fillna(mode.iloc[0] if not mode.empty else "unknown")
+    return df, drop_cols
+
+
+# --------------------------------------------------------------------------- #
+# 7. Outliers
+# --------------------------------------------------------------------------- #
+def handle_outliers(df, method="clip", protected=()):
+    df = df.copy()
+    n_affected = 0
+    num_cols = [c for c in df.select_dtypes(include=np.number).columns if c not in protected]
+    for col in num_cols:
+        if df[col].nunique() <= 2:  # skip binary flags
+            continue
+        q1, q3 = df[col].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        mask = (df[col] < lo) | (df[col] > hi)
+        n_affected += int(mask.sum())
+        if method == "clip":
+            df[col] = df[col].clip(lo, hi)
+        elif method == "remove":
+            df = df[~mask]
+    return df, n_affected
+
+
+# --------------------------------------------------------------------------- #
+# 8. Encoding
+# --------------------------------------------------------------------------- #
+def encode_categoricals(df, method="onehot", max_card=20, protected=()):
+    df = df.copy()
+    cat_cols = [
+        c for c in df.select_dtypes(include=["object", "string", "category", "bool"]).columns
+        if c not in protected
+    ]
+    # high-cardinality columns (IDs, free text) are dropped rather than exploded
+    high = [c for c in cat_cols if df[c].nunique() > max_card and df[c].dtype != bool]
+    df = df.drop(columns=high)
+    cat_cols = [c for c in cat_cols if c not in high]
+
+    if method == "onehot":
+        df = pd.get_dummies(df, columns=cat_cols, drop_first=True, dtype=int)
+    elif method == "label":
+        for c in cat_cols:
+            df[c] = df[c].astype("category").cat.codes
+    return df, high
+
+
+# --------------------------------------------------------------------------- #
+# 9. Scaling
+# --------------------------------------------------------------------------- #
+def scale_numeric(df, method="standard", protected=()):
+    df = df.copy()
+    cols = [
+        c for c in df.select_dtypes(include=np.number).columns
+        if c not in protected and df[c].nunique() > 2
+    ]
+    for c in cols:
+        if method == "standard":
+            std = df[c].std()
+            df[c] = (df[c] - df[c].mean()) / std if std else 0.0
+        elif method == "minmax":
+            rng = df[c].max() - df[c].min()
+            df[c] = (df[c] - df[c].min()) / rng if rng else 0.0
+    return df, cols
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+def preprocess(df: pd.DataFrame, args) -> pd.DataFrame:
+    report = {"original_shape": df.shape}
+
+    df = clean_columns(df)
+    target = args.target.strip().lower().replace(" ", "_") if args.target else None
+    protected = (target,) if target else ()
+
+    df = standardise_missing(df)
+
+    before = len(df)
+    df = df.drop_duplicates()
+    report["duplicates_removed"] = before - len(df)
+
+    df = convert_types(df)
+
+    report["missing_before"] = int(df.isna().sum().sum())
+    df, dropped_cols = handle_missing(df, args.col_missing, args.row_missing, protected)
+    report["columns_dropped_missing"] = dropped_cols
+
+    # expand datetime columns into useful numeric parts, then drop the original
+    for c in df.select_dtypes(include="datetime").columns:
+        df[f"{c}_year"] = df[c].dt.year
+        df[f"{c}_month"] = df[c].dt.month
+        df[f"{c}_day"] = df[c].dt.day
+        df[f"{c}_dayofweek"] = df[c].dt.dayofweek
+        df = df.drop(columns=c)
+
+    if args.outliers != "none":
+        df, n_out = handle_outliers(df, args.outliers, protected)
+        report["outliers_handled"] = n_out
+
+    if args.encode != "none":
+        df, high_card = encode_categoricals(df, args.encode, protected=protected)
+        report["high_cardinality_dropped"] = high_card
+
+    if args.scale != "none":
+        df, scaled = scale_numeric(df, args.scale, protected)
+        report["columns_scaled"] = len(scaled)
+
+    report["final_shape"] = df.shape
+    print_report(report)
+    return df
+
+
+def print_report(r: dict):
+    print("\n=== Preprocessing report ===")
+    print(f"Original shape            : {r['original_shape']}")
+    print(f"Duplicate rows removed    : {r['duplicates_removed']}")
+    print(f"Missing cells (pre-impute): {r['missing_before']}")
+    print(f"Columns dropped (missing) : {r['columns_dropped_missing'] or 'none'}")
+    if "outliers_handled" in r:
+        print(f"Outlier values handled    : {r['outliers_handled']}")
+    if "high_cardinality_dropped" in r:
+        print(f"High-cardinality dropped  : {r['high_cardinality_dropped'] or 'none'}")
+    if "columns_scaled" in r:
+        print(f"Columns scaled            : {r['columns_scaled']}")
+    print(f"Final shape               : {r['final_shape']}\n")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Preprocess a CSV/XLS/XLSX file.")
+    p.add_argument("input", help="Path to .csv, .tsv, .xls or .xlsx file")
+    p.add_argument("-o", "--output", help="Output path (default: <input>_processed.csv)")
+    p.add_argument("--sheet", default=0, help="Sheet name/index for Excel files (default: first)")
+    p.add_argument("--target", help="Target column to leave unscaled/unencoded/undropped")
+    p.add_argument("--col-missing", type=float, default=0.5,
+                   help="Drop columns with more than this fraction missing (default 0.5)")
+    p.add_argument("--row-missing", type=float, default=0.5,
+                   help="Drop rows with more than this fraction missing (default 0.5)")
+    p.add_argument("--outliers", choices=["clip", "remove", "none"], default="clip")
+    p.add_argument("--encode", choices=["onehot", "label", "none"], default="onehot")
+    p.add_argument("--scale", choices=["standard", "minmax", "none"], default="standard")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+
+    df = load_data(args.input, sheet)
+    print(f"Loaded {args.input}: {df.shape[0]} rows x {df.shape[1]} columns")
+
+    processed = preprocess(df, args)
+
+    out = args.output or str(Path(args.input).with_suffix("")) + "_processed.csv"
+    processed.to_csv(out, index=False)
+    print(f"Saved processed data to: {out}")
+
+
+if __name__ == "__main__":
+    main()
